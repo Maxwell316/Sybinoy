@@ -1,0 +1,227 @@
+// =============================================================================
+// PrivateQF — Sybil-resistant private Quadratic Funding
+// =============================================================================
+//
+// Quadratic funding (Gitcoin-style) is gameable because donations are public:
+// an attacker can watch who donated what and split one donor's money across
+// many wallets to exploit the sqrt() curve (more small donors > one big one).
+// This contract keeps donor identity AND donation amount private, while still
+// cryptographically guaranteeing "one unique human = one contribution" per
+// project per round, so the quadratic math cannot be gamed by sockpuppets.
+//
+// PUBLIC (on-chain ledger state, visible to anyone):
+//   - admin               : hash-commitment identifying the round operator
+//   - roundId             : identifier of the currently active funding round
+//   - identityTree        : Merkle root registry of eligible donor identity
+//                            commitments (who is registered is NOT revealed —
+//                            only that the registry root itself exists)
+//   - registeredIdentities: public count of how many unique identities have
+//                            ever been registered
+//   - spentNullifiers     : set of nullifiers already used to contribute —
+//                            this is what stops the same verified human from
+//                            contributing twice to the same project/round
+//   - contributionCommitments: nullifier -> hiding+binding commitment to a
+//                            donation amount (the amount itself is NOT here)
+//   - donorCount          : per-project public count of unique contributors
+//                            (this is meant to be public — QF is built on
+//                            donor-count, not on amount)
+//   - settledNullifiers   : set of nullifiers whose commitment has already
+//                            been opened during settlement (anti-replay)
+//   - settledWeightSum    : per-project running sum of sqrt(amount) — the
+//                            quantity quadratic-funding matching is based on
+//   - settledTotal        : per-project running sum of raw settled amounts
+//   - settledCount        : per-project count of settled contributions
+//
+// PRIVATE (witness data — supplied by the donor's own client, NEVER sent to
+// the chain, NEVER appears in this file's logic beyond a hash/commitment):
+//   - identitySecret      : the donor's personal secret; a one-time
+//                            registration binds persistentHash(identitySecret)
+//                            into identityTree as an anonymous set member
+//   - identityPath        : the Merkle inclusion proof for the donor's own
+//                            identity leaf (proves membership, not identity)
+//   - donationAmount      : the raw amount the donor pledges
+//   - blinding            : randomness used to hide donationAmount inside a
+//                            commitment
+//   - adminSecret         : the round operator's secret (only used locally by
+//                            the operator's own client to authorize admin
+//                            actions; never touches the chain)
+//
+// WHAT A DONOR PROVES WITHOUT REVEALING ANYTHING ELSE:
+//   1. "I am one of the registered eligible identities" — a zero-knowledge
+//      Merkle membership proof that does NOT reveal which leaf is theirs.
+//   2. "I have not already contributed to this exact project in this round"
+//      — enforced by a deterministic nullifier derived from their private
+//      identity secret; the same secret always produces the same nullifier
+//      for a given (round, project), so reuse is publicly detectable and
+//      rejected, even though the identity behind it stays hidden.
+//   3. "I am pledging a specific amount I cannot later change" — a hiding
+//      and binding commitment recorded on-chain in place of the raw amount.
+//
+// KNOWN LIMITATION (documented honestly, see README "Privacy Model"):
+//   Computing the public quadratic-matching totals requires each donor's
+//   commitment to eventually be opened (settleContribution). At that point
+//   the specific amount for that nullifier becomes visible on-chain — but
+//   the nullifier is cryptographically unlinkable to the donor's identity or
+//   wallet, so amounts are de-anonymized from a specific *contribution*, not
+//   from a specific *person*. Removing this last step entirely would require
+//   an aggregate ZK sum-of-square-roots proof (or MPC settlement), which is
+//   out of scope for this Level 1 build and is called out as future work.
+// =============================================================================
+
+pragma language_version >= 0.16;
+
+import CompactStandardLibrary;
+
+// ---------------------------------------------------------------------------
+// Public ledger state
+// ---------------------------------------------------------------------------
+
+export ledger admin: Bytes<32>;
+export ledger roundId: Bytes<32>;
+
+export ledger identityTree: HistoricMerkleTree<10, Bytes<32>>;
+export ledger registeredIdentities: Counter;
+
+export ledger spentNullifiers: Map<Bytes<32>, Boolean>;
+export ledger contributionCommitments: Map<Bytes<32>, Bytes<32>>;
+export ledger donorCount: Map<Bytes<32>, Uint<64>>;
+
+export ledger settledNullifiers: Map<Bytes<32>, Boolean>;
+export ledger settledWeightSum: Map<Bytes<32>, Uint<64>>;
+export ledger settledTotal: Map<Bytes<32>, Uint<64>>;
+export ledger settledCount: Map<Bytes<32>, Uint<64>>;
+
+// ---------------------------------------------------------------------------
+// Constructor — sets the round operator and the first round id
+// ---------------------------------------------------------------------------
+
+constructor(adminKeyHash: Bytes<32>, initialRoundId: Bytes<32>) {
+  admin = disclose(adminKeyHash);
+  roundId = disclose(initialRoundId);
+}
+
+// ---------------------------------------------------------------------------
+// Witnesses — private, client-side only
+// ---------------------------------------------------------------------------
+
+witness localAdminSecret(): Bytes<32>;
+witness localIdentitySecret(): Bytes<32>;
+witness localIdentityPath(): MerkleTreePath<10, Bytes<32>>;
+witness localBlinding(projectId: Bytes<32>): Bytes<32>;
+witness localSqrtHint(amount: Uint<32>): Uint<32>;
+
+// ---------------------------------------------------------------------------
+// Admin: registry + round management
+// ---------------------------------------------------------------------------
+
+// Adds a new eligible-donor identity commitment to the registry. In
+// production, `commitment` would only be issued after an off-chain,
+// Sybil-resistant proof-of-personhood check (e.g. a passport/KYC provider or
+// a decentralized uniqueness protocol) — this contract enforces the
+// cryptographic *consequence* of that check (one-nullifier-per-human), not
+// the check itself.
+export circuit registerIdentity(commitment: Bytes<32>): [] {
+  assert(persistentHash<Bytes<32>>(localAdminSecret()) == admin, "PrivateQF: caller is not the round admin");
+  identityTree.insert(disclose(commitment));
+  registeredIdentities.increment(1);
+}
+
+// Starts a fresh funding round. Nullifiers are domain-separated by roundId,
+// so a new round gives every registered identity a clean slate without
+// needing to re-register.
+export circuit startNewRound(newRoundId: Bytes<32>): [] {
+  assert(persistentHash<Bytes<32>>(localAdminSecret()) == admin, "PrivateQF: caller is not the round admin");
+  roundId = disclose(newRoundId);
+}
+
+// ---------------------------------------------------------------------------
+// Donor: private contribution
+// ---------------------------------------------------------------------------
+
+// A donor contributes `amount` to `projectId`. Their identity and the amount
+// stay private; only a nullifier (proves uniqueness) and a commitment
+// (hides but binds the amount) are recorded on-chain.
+export circuit contribute(projectId: Bytes<32>, amount: Uint<32>): [] {
+  assert(amount > 0, "PrivateQF: donation must be greater than zero");
+
+  const secret = localIdentitySecret();
+  const path = localIdentityPath();
+  const expectedLeaf = persistentHash<Bytes<32>>(secret);
+  assert(path.leaf == expectedLeaf, "PrivateQF: identity path does not match derived commitment");
+
+  const computedRoot = merkleTreePathRoot<10, Bytes<32>>(disclose(path));
+  assert(identityTree.checkRoot(computedRoot), "PrivateQF: identity is not registered as eligible");
+
+  const nullifier = persistentHash<Vector<4, Bytes<32>>>([
+    pad(32, "privateqf:nullifier:"),
+    roundId,
+    projectId,
+    secret
+  ]);
+  assert(!spentNullifiers.member(disclose(nullifier)), "PrivateQF: this identity already contributed to this project this round");
+  spentNullifiers.insert(disclose(nullifier), disclose(true));
+
+  const blinding = localBlinding(projectId);
+  const commitment = persistentCommit<Uint<32>>(amount, blinding);
+  contributionCommitments.insert(disclose(nullifier), disclose(commitment));
+
+  if (donorCount.member(disclose(projectId))) {
+    const current = donorCount.lookup(disclose(projectId));
+    donorCount.insert(disclose(projectId), (current + 1) as Uint<64>);
+  } else {
+    donorCount.insert(disclose(projectId), 1 as Uint<64>);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Donor: settlement — folds a previously-hidden contribution into the public
+// quadratic-matching totals for its project. See the "KNOWN LIMITATION" note
+// at the top of this file: this is the step where the amount for this one
+// nullifier becomes visible on-chain (never the identity behind it).
+// ---------------------------------------------------------------------------
+
+export circuit settleContribution(projectId: Bytes<32>, amount: Uint<32>): [] {
+  const secret = localIdentitySecret();
+  const nullifier = persistentHash<Vector<4, Bytes<32>>>([
+    pad(32, "privateqf:nullifier:"),
+    roundId,
+    projectId,
+    secret
+  ]);
+  assert(spentNullifiers.member(disclose(nullifier)), "PrivateQF: no contribution found for this identity/project/round");
+  assert(!settledNullifiers.member(disclose(nullifier)), "PrivateQF: contribution already settled");
+
+  const blinding = localBlinding(projectId);
+  const recomputed = persistentCommit<Uint<32>>(amount, blinding);
+  const stored = contributionCommitments.lookup(disclose(nullifier));
+  assert(disclose(recomputed) == stored, "PrivateQF: amount/blinding do not match the original commitment");
+
+  const hint = localSqrtHint(amount);
+  const hint64 = disclose(hint) as Uint<64>;
+  const amount64 = amount as Uint<64>;
+  assert(hint64 * hint64 <= amount64, "PrivateQF: sqrt hint too large");
+  assert((hint64 + 1) * (hint64 + 1) > amount64, "PrivateQF: sqrt hint too small");
+
+  settledNullifiers.insert(disclose(nullifier), disclose(true));
+
+  if (settledWeightSum.member(disclose(projectId))) {
+    const currentWeight = settledWeightSum.lookup(disclose(projectId));
+    settledWeightSum.insert(disclose(projectId), (currentWeight + hint64) as Uint<64>);
+  } else {
+    settledWeightSum.insert(disclose(projectId), hint64);
+  }
+
+  if (settledTotal.member(disclose(projectId))) {
+    const currentTotal = settledTotal.lookup(disclose(projectId));
+    settledTotal.insert(disclose(projectId), (currentTotal + disclose(amount64)) as Uint<64>);
+  } else {
+    settledTotal.insert(disclose(projectId), disclose(amount64));
+  }
+
+  if (settledCount.member(disclose(projectId))) {
+    const currentCount = settledCount.lookup(disclose(projectId));
+    settledCount.insert(disclose(projectId), (currentCount + 1) as Uint<64>);
+  } else {
+    settledCount.insert(disclose(projectId), 1 as Uint<64>);
+  }
+}
