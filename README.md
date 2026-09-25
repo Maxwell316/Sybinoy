@@ -6,7 +6,7 @@
 
 | Network | Address |
 |---------|---------|
-| Preview | _not yet deployed_ |
+| Preview | be09d0480809e425d8b271bb36d3e95992ce9d8d1446fcce86a75319795706b0|
 | Preprod | _not yet deployed_ |
 
 The contract compiles cleanly and is fully tested locally (see [Run Tests](#run-tests)), but has **not been deployed to a public testnet yet**. Deployment to Preview/Preprod requires a funded Midnight testnet wallet (tNight, via the [Preview](https://faucet.preview.midnight.network/) / [Preprod](https://faucet.preprod.midnight.network/) faucets) and the full `midnight-js` wallet/provider stack, which needs a real seed phrase the assistant building this repo does not have and should not generate on your behalf. See [Deploying](#deploying) below for exact next steps to fill this table in yourself.
